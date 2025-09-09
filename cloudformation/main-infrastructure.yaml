@@ -1,0 +1,282 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Media Processing Pipeline with Security Controls'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: Environment name
+  
+  ProjectName:
+    Type: String
+    Default: 'media-processing-pipeline'
+    Description: Project name for resource naming
+
+Resources:
+  # Parameter Store entries for S3 bucket configuration
+  MediaBucketNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Environment}/s3/media-bucket-name'
+      Type: String
+      Value: !Ref MediaBucket
+      Description: 'S3 bucket name for storing media files'
+
+  ProcessedBucketNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Environment}/s3/processed-bucket-name'
+      Type: String
+      Value: !Ref ProcessedMediaBucket
+      Description: 'S3 bucket name for processed media files'
+
+  MediaKeyPrefixParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub '/${ProjectName}/${Environment}/s3/media-key-prefix'
+      Type: String
+      Value: 'media/'
+      Description: 'Prefix for media file keys in S3'
+
+  # S3 Buckets for media processing
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-media-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      NotificationConfiguration:
+        CloudWatchConfigurations:
+          - Event: 's3:ObjectCreated:*'
+            CloudWatchConfiguration:
+              LogGroupName: !Ref MediaBucketLogGroup
+      LoggingConfiguration:
+        DestinationBucketName: !Ref LoggingBucket
+        LogFilePrefix: 'media-access-logs/'
+
+  ProcessedMediaBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-processed-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  LoggingBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub '${ProjectName}-${Environment}-logs-${AWS::AccountId}'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # CloudWatch Log Group for S3 access
+  MediaBucketLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/s3/${ProjectName}-${Environment}-media'
+      RetentionInDays: 30
+
+  # IAM Role for Lambda functions
+  MediaProcessingLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${ProjectName}-${Environment}-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: MediaProcessingPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - !Sub '${MediaBucket}/*'
+                  - !Sub '${ProcessedMediaBucket}/*'
+              - Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource:
+                  - !Ref MediaBucket
+                  - !Ref ProcessedMediaBucket
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                  - ssm:GetParameters
+                Resource:
+                  - !Ref MediaBucketNameParameter
+                  - !Ref ProcessedBucketNameParameter
+                  - !Ref MediaKeyPrefixParameter
+              - Effect: Allow
+                Action:
+                  - macie2:GetMacieSession
+                  - macie2:GetFindings
+                Resource: '*'
+
+  # Lambda function for processing PII detection events
+  PIIEventProcessorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${ProjectName}-${Environment}-pii-processor'
+      Runtime: python3.9
+      Handler: pii_processor.lambda_handler
+      Role: !GetAtt 
+        - MediaProcessingLambdaRole
+        - Arn
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          def lambda_handler(event, context):
+              logger.info(f"Received PII detection event: {json.dumps(event)}")
+              
+              # Process Macie findings
+              for record in event.get('Records', []):
+                  if record.get('source') == 'aws.macie2':
+                      process_macie_finding(record)
+              
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('PII event processed successfully')
+              }
+
+          def process_macie_finding(record):
+              detail = record.get('detail', {})
+              finding_id = detail.get('id')
+              severity = detail.get('severity', {}).get('description')
+              
+              logger.info(f"Processing Macie finding {finding_id} with severity {severity}")
+              
+              # Additional processing logic would go here
+              # For example: quarantine file, send notifications, etc.
+      Environment:
+        Variables:
+          ENVIRONMENT: !Ref Environment
+          PROJECT_NAME: !Ref ProjectName
+      Timeout: 60
+
+  # EventBridge Rule for Macie findings
+  MacieEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-macie-events'
+      Description: 'Trigger Lambda for Macie PII findings'
+      EventPattern:
+        source:
+          - 'aws.macie2'
+        detail-type:
+          - 'Macie Finding'
+        detail:
+          severity:
+            description:
+              - 'HIGH'
+              - 'MEDIUM'
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt 
+            - PIIEventProcessorFunction
+            - Arn
+          Id: 'PIIProcessorTarget'
+
+  # Permission for EventBridge to invoke Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PIIEventProcessorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt 
+        - MacieEventRule
+        - Arn
+
+  # Macie Session (enables Macie in the account)
+  MacieSession:
+    Type: AWS::Macie2::Session
+    Properties:
+      Status: ENABLED
+      FindingPublishingFrequency: FIFTEEN_MINUTES
+
+  # Classification Job for the media bucket
+  MacieClassificationJob:
+    Type: AWS::Macie2::ClassificationJob
+    Properties:
+      Name: !Sub '${ProjectName}-${Environment}-media-classification'
+      JobType: SCHEDULED
+      ScheduleFrequency:
+        DailySchedule: {}
+      S3JobDefinition:
+        BucketDefinitions:
+          - AccountId: !Ref AWS::AccountId
+            Buckets:
+              - !Ref MediaBucket
+        Scoping:
+          Includes:
+            And:
+              - SimpleScopeTerm:
+                  Comparator: EQ
+                  Key: BUCKET_NAME
+                  Values:
+                    - !Ref MediaBucket
+
+Outputs:
+  MediaBucketName:
+    Description: 'Name of the media S3 bucket'
+    Value: !Ref MediaBucket
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-MediaBucket'
+
+  ProcessedBucketName:
+    Description: 'Name of the processed media S3 bucket'
+    Value: !Ref ProcessedMediaBucket
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ProcessedBucket'
+
+  PIIProcessorFunctionArn:
+    Description: 'ARN of the PII processor Lambda function'
+    Value: !GetAtt 
+      - PIIEventProcessorFunction
+      - Arn
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-PIIProcessorArn'
+
+  ParameterStorePrefix:
+    Description: 'Parameter Store prefix for configuration'
+    Value: !Sub '/${ProjectName}/${Environment}'
+    Export:
+      Name: !Sub '${ProjectName}-${Environment}-ParameterPrefix'
